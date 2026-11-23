@@ -1,0 +1,96 @@
+name: Deploy to GitHub Pages
+
+on:
+  push:
+    branches: [main]
+
+permissions: {}
+
+concurrency:
+  group: github-pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pages: read
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: trono_test_bootstrap
+          POSTGRES_HOST_AUTH_METHOD: trust
+        options: >-
+          --health-cmd "pg_isready -h 127.0.0.1 -U trono_test_bootstrap"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Set up Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: '24'
+          cache: npm
+      - name: Install dependencies
+        run: npm ci
+      - name: Run unit tests
+        run: npm test
+      - name: Run PostgreSQL tests
+        env:
+          POSTGRES_CONTAINER: ${{ job.services.postgres.id }}
+        run: |
+          docker exec "$POSTGRES_CONTAINER" psql -X -U trono_test_bootstrap -v ON_ERROR_STOP=1 \
+            -c 'create role postgres login createrole; create role anon nologin; create role authenticated nologin; create role service_role nologin bypassrls; grant anon to postgres;' \
+            -c 'create database queruleertrono_test owner postgres'
+          docker exec -i "$POSTGRES_CONTAINER" psql -X -U postgres -d queruleertrono_test -v ON_ERROR_STOP=1 \
+            -f - < supabase/migrations/20261123000100_office_draw.sql
+          docker exec -i "$POSTGRES_CONTAINER" psql -X -U postgres -d queruleertrono_test \
+            -f - < supabase/tests/office_draw.sql
+          python3 supabase/tests/concurrency.py docker exec "$POSTGRES_CONTAINER" psql -U postgres -d queruleertrono_test
+      - name: Build for GitHub Pages
+        env:
+          VITE_SUPABASE_URL: ${{ vars.VITE_SUPABASE_URL }}
+          VITE_SUPABASE_PUBLISHABLE_KEY: ${{ secrets.VITE_SUPABASE_PUBLISHABLE_KEY }}
+        run: |
+          node --input-type=module <<'NODE'
+          const key = process.env.VITE_SUPABASE_PUBLISHABLE_KEY?.trim()
+          let url
+          try {
+            url = new URL(process.env.VITE_SUPABASE_URL)
+          } catch {}
+          if (url?.protocol !== 'https:' || url.username || url.password || url.hostname === 'your-project.supabase.co') {
+            console.error('Set VITE_SUPABASE_URL to the project HTTPS URL in Actions variables.')
+            process.exit(1)
+          }
+          if (!key || !/^sb_publishable_[A-Za-z0-9_-]+$/.test(key) || key === 'sb_publishable_your_key') {
+            console.error('Set VITE_SUPABASE_PUBLISHABLE_KEY to a publishable key in Actions secrets.')
+            process.exit(1)
+          }
+          NODE
+          npm run build
+      - name: Configure GitHub Pages
+        uses: actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d # v6
+      - name: Upload production build
+        uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5
+        with:
+          path: dist
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5
